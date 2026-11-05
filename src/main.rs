@@ -34,6 +34,7 @@ enum Cmd {
     Copy,
     Paste,
     SelectAll,
+    Highlight,
     Find,
     FindNext,
     About,
@@ -64,6 +65,8 @@ const MENUS: [(&str, &[Item]); 4] = [
             ("Paste", "Ctrl+V", Cmd::Paste),
             ("-", "", Cmd::Sep),
             ("Select All", "Ctrl+A", Cmd::SelectAll),
+            ("-", "", Cmd::Sep),
+            ("Syntax Highlight", "", Cmd::Highlight),
         ],
     ),
     (
@@ -190,6 +193,7 @@ struct Editor {
     modified: bool,
     trailing_nl: bool,
     clipboard: String,
+    highlight: bool,
     osc: Option<String>,
     undo: Vec<(Vec<Vec<char>>, usize, usize)>,
     typing: bool,
@@ -215,6 +219,7 @@ impl Editor {
             modified: false,
             trailing_nl: true,
             clipboard: String::new(),
+            highlight: false,
             osc: None,
             undo: Vec::new(),
             typing: false,
@@ -581,6 +586,11 @@ impl Editor {
             Cmd::Copy => self.copy(),
             Cmd::Paste => self.paste(),
             Cmd::SelectAll => self.select_all(),
+            Cmd::Highlight => {
+                self.highlight = !self.highlight;
+                let state = if self.highlight { "on" } else { "off" };
+                self.status = format!("Syntax highlighting {}", state);
+            }
             Cmd::Find => {
                 self.mode = Mode::Prompt { kind: PromptKind::Find, input: self.last_find.clone() };
             }
@@ -1049,10 +1059,24 @@ impl Editor {
 
         // text area, framed by │ borders
         let sel = self.sel_range();
+        // Highlighting is opt-in and streaming: only the carry state is kept for
+        // lines above the viewport, plus one reusable per-line buffer.
+        let lang = if self.highlight { self.path.as_deref().and_then(lang_for) } else { None };
+        let mut carry = Carry::None;
+        let mut classes: Vec<Hl> = Vec::new();
+        if let Some(l) = lang {
+            for line in self.lines.iter().take(self.top) {
+                lex_line(l, line, &mut carry, &mut classes);
+            }
+        }
         for r in 0..th {
             let y = 1 + r;
             let idx = self.top + r;
             let line: &[char] = self.lines.get(idx).map(|l| l.as_slice()).unwrap_or(&[]);
+            match lang {
+                Some(l) => lex_line(l, line, &mut carry, &mut classes),
+                None => classes.clear(),
+            }
             let (a, b) = match sel {
                 Some((s, e)) if idx >= s.0 && idx <= e.0 => (
                     if idx == s.0 { s.1 } else { 0 },
@@ -1064,17 +1088,17 @@ impl Editor {
             put(out, w - 1, y, "│", BORDER)?;
             queue!(out, cursor::MoveTo(1, y as u16))?;
             let mut buf = String::new();
-            let mut cur_sel = false;
+            let mut cur = (false, Hl::Plain);
             style(out, TXT)?;
             for col in self.left..self.left + tw {
                 let ch = line.get(col).copied().unwrap_or(' ');
                 let ch = if ch.is_control() { '\u{b7}' } else { ch };
-                let s = col >= a && col < b;
-                if s != cur_sel {
+                let key = (col >= a && col < b, classes.get(col).copied().unwrap_or(Hl::Plain));
+                if key != cur {
                     queue!(out, Print(&buf))?;
                     buf.clear();
-                    style(out, if s { SEL } else { TXT })?;
-                    cur_sel = s;
+                    style(out, if key.0 { SEL } else { key.1.style() })?;
+                    cur = key;
                 }
                 buf.push(ch);
             }
@@ -1107,7 +1131,7 @@ impl Editor {
             Mode::Edit => {
                 cursor_at = Some((self.cx - self.left + 1, self.cy - self.top + 1));
             }
-            Mode::Menu { top, item } => draw_dropdown(out, w, *top, *item)?,
+            Mode::Menu { top, item } => draw_dropdown(out, w, *top, *item, self.highlight)?,
             Mode::Prompt { kind, input } => {
                 let (title, label) = match kind {
                     PromptKind::Find => ("Find", "Find what:"),
@@ -1151,6 +1175,255 @@ impl Editor {
             }
         }
         out.flush()
+    }
+}
+
+// -------------------------------------------------------- highlighting ---
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hl {
+    Plain,
+    Keyword,
+    Str,
+    Comment,
+    Number,
+}
+
+impl Hl {
+    fn style(self) -> St {
+        match self {
+            Hl::Plain => TXT,
+            // IntelliJ IDEA "Darcula" palette (truecolor).
+            Hl::Keyword => St { fg: Color::Rgb { r: 0xCC, g: 0x78, b: 0x32 }, bold: false, rev: false },
+            Hl::Str => St { fg: Color::Rgb { r: 0x6A, g: 0x87, b: 0x59 }, bold: false, rev: false },
+            Hl::Comment => St { fg: Color::Rgb { r: 0x80, g: 0x80, b: 0x80 }, bold: false, rev: false },
+            Hl::Number => St { fg: Color::Rgb { r: 0x68, g: 0x97, b: 0xBB }, bold: false, rev: false },
+        }
+    }
+}
+
+/// A language definition for the small hand-rolled lexer: line comments, one
+/// block-comment pair, single-line strings, optional triple-quoted strings
+/// (Python), numbers and a keyword list.
+struct Lang {
+    exts: &'static [&'static str],
+    keywords: &'static [&'static str],
+    line_comment: &'static [&'static str],
+    block_comment: Option<(&'static str, &'static str)>,
+    quotes: &'static str,
+    triple: bool,
+}
+
+const C_KW: &[&str] = &[
+    "if", "else", "for", "while", "do", "switch", "case", "default", "break", "continue", "return", "goto",
+    "struct", "union", "enum", "typedef", "static", "const", "extern", "volatile", "sizeof", "void", "int",
+    "char", "short", "long", "float", "double", "unsigned", "signed", "class", "public", "private",
+    "protected", "namespace", "template", "typename", "using", "new", "delete", "try", "catch", "throw",
+    "true", "false", "nullptr", "NULL", "bool", "auto", "virtual", "override", "inline",
+];
+
+const JAVA_KW: &[&str] = &[
+    "abstract", "class", "interface", "extends", "implements", "public", "private", "protected", "static",
+    "final", "void", "int", "long", "double", "float", "boolean", "char", "byte", "new", "return", "if",
+    "else", "for", "while", "do", "switch", "case", "default", "break", "continue", "try", "catch",
+    "finally", "throw", "throws", "import", "package", "this", "super", "null", "true", "false", "var",
+    "val", "fun", "let", "func", "struct", "enum",
+];
+
+const JS_KW: &[&str] = &[
+    "var", "let", "const", "function", "return", "if", "else", "for", "while", "do", "switch", "case",
+    "default", "break", "continue", "class", "extends", "new", "this", "super", "import", "export", "from",
+    "async", "await", "try", "catch", "finally", "throw", "typeof", "instanceof", "in", "of", "null",
+    "undefined", "true", "false", "interface", "type", "enum", "implements", "public", "private", "static",
+    "yield", "void", "delete",
+];
+
+const RUST_KW: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
+    "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
+];
+
+const GO_KW: &[&str] = &[
+    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "for", "func",
+    "go", "goto", "if", "import", "interface", "map", "package", "range", "return", "select", "struct",
+    "switch", "type", "var", "nil", "true", "false",
+];
+
+const PY_KW: &[&str] = &[
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else",
+    "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not",
+    "or", "pass", "raise", "return", "try", "while", "with", "yield", "None", "True", "False", "self",
+];
+
+const SH_KW: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "function",
+    "in", "return", "exit", "local", "export", "set", "source", "echo", "cd",
+];
+
+const SLASH: Option<(&str, &str)> = Some(("/*", "*/"));
+
+const LANGS: &[Lang] = &[
+    Lang { exts: &["rs"], keywords: RUST_KW, line_comment: &["//"], block_comment: SLASH, quotes: "\"", triple: false },
+    Lang {
+        exts: &["c", "h", "cc", "cpp", "cxx", "hpp", "hh"],
+        keywords: C_KW,
+        line_comment: &["//"],
+        block_comment: SLASH,
+        quotes: "\"'",
+        triple: false,
+    },
+    Lang {
+        exts: &["java", "cs", "kt", "swift"],
+        keywords: JAVA_KW,
+        line_comment: &["//"],
+        block_comment: SLASH,
+        quotes: "\"'",
+        triple: false,
+    },
+    Lang {
+        exts: &["js", "jsx", "ts", "tsx", "mjs", "cjs"],
+        keywords: JS_KW,
+        line_comment: &["//"],
+        block_comment: SLASH,
+        quotes: "\"'`",
+        triple: false,
+    },
+    Lang { exts: &["go"], keywords: GO_KW, line_comment: &["//"], block_comment: SLASH, quotes: "\"'`", triple: false },
+    Lang { exts: &["py", "pyw"], keywords: PY_KW, line_comment: &["#"], block_comment: None, quotes: "\"'", triple: true },
+    Lang {
+        exts: &["sh", "bash", "zsh"],
+        keywords: SH_KW,
+        line_comment: &["#"],
+        block_comment: None,
+        quotes: "\"'",
+        triple: false,
+    },
+    Lang {
+        exts: &["toml", "ini", "conf", "cfg", "yaml", "yml"],
+        keywords: &["true", "false"],
+        line_comment: &["#", ";"],
+        block_comment: None,
+        quotes: "\"'",
+        triple: false,
+    },
+    Lang {
+        exts: &["json"],
+        keywords: &["true", "false", "null"],
+        line_comment: &[],
+        block_comment: None,
+        quotes: "\"",
+        triple: false,
+    },
+];
+
+fn lang_for(path: &std::path::Path) -> Option<&'static Lang> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    LANGS.iter().find(|l| l.exts.contains(&ext.as_str()))
+}
+
+/// Multi-line lexer state carried from one line to the next.
+#[derive(Clone, Copy, PartialEq)]
+enum Carry {
+    None,
+    Block,
+    Triple(char),
+}
+
+fn starts_with(line: &[char], at: usize, pat: &str) -> bool {
+    pat.chars().enumerate().all(|(k, c)| line.get(at + k) == Some(&c))
+}
+
+fn triple_at(line: &[char], at: usize, q: char) -> bool {
+    line.get(at) == Some(&q) && line.get(at + 1) == Some(&q) && line.get(at + 2) == Some(&q)
+}
+
+/// Classify every char of `line` into `cls` (reused between calls), updating
+/// `carry` for block comments / triple-quoted strings that span lines.
+fn lex_line(lang: &Lang, line: &[char], carry: &mut Carry, cls: &mut Vec<Hl>) {
+    cls.clear();
+    cls.resize(line.len(), Hl::Plain);
+    let mut i = 0;
+    while i < line.len() {
+        match *carry {
+            Carry::Block => {
+                let end = lang.block_comment.map_or("", |b| b.1);
+                let start = i;
+                while i < line.len() && !starts_with(line, i, end) {
+                    i += 1;
+                }
+                if i < line.len() {
+                    i = (i + end.chars().count()).min(line.len());
+                    *carry = Carry::None;
+                }
+                cls[start..i].fill(Hl::Comment);
+                continue;
+            }
+            Carry::Triple(q) => {
+                let start = i;
+                while i < line.len() && !triple_at(line, i, q) {
+                    i += if line[i] == '\\' { 2 } else { 1 };
+                }
+                i = i.min(line.len());
+                if i < line.len() {
+                    i = (i + 3).min(line.len());
+                    *carry = Carry::None;
+                }
+                cls[start..i].fill(Hl::Str);
+                continue;
+            }
+            Carry::None => {}
+        }
+        let c = line[i];
+        if lang.line_comment.iter().any(|p| starts_with(line, i, p)) {
+            cls[i..].fill(Hl::Comment);
+            return;
+        }
+        if let Some((open, _)) = lang.block_comment {
+            if starts_with(line, i, open) {
+                *carry = Carry::Block;
+                let n = open.chars().count();
+                cls[i..(i + n).min(line.len())].fill(Hl::Comment);
+                i += n;
+                continue;
+            }
+        }
+        if lang.quotes.contains(c) {
+            if lang.triple && triple_at(line, i, c) {
+                *carry = Carry::Triple(c);
+                cls[i..(i + 3).min(line.len())].fill(Hl::Str);
+                i += 3;
+                continue;
+            }
+            let start = i;
+            i += 1;
+            while i < line.len() && line[i] != c {
+                i += if line[i] == '\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(line.len());
+            cls[start..i].fill(Hl::Str);
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < line.len() && (line[i].is_ascii_alphanumeric() || line[i] == '.' || line[i] == '_') {
+                i += 1;
+            }
+            cls[start..i].fill(Hl::Number);
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < line.len() && (line[i].is_alphanumeric() || line[i] == '_') {
+                i += 1;
+            }
+            let word: String = line[start..i].iter().collect();
+            if lang.keywords.contains(&word.as_str()) {
+                cls[start..i].fill(Hl::Keyword);
+            }
+            continue;
+        }
+        i += 1;
     }
 }
 
@@ -1266,7 +1539,7 @@ fn menu_at(x: usize) -> Option<usize> {
     (0..MENUS.len()).find(|&i| x >= menu_x(i) && x < menu_x(i) + MENUS[i].0.len() + 2)
 }
 
-fn draw_dropdown<W: Write>(out: &mut W, w: usize, top: usize, sel: usize) -> io::Result<()> {
+fn draw_dropdown<W: Write>(out: &mut W, w: usize, top: usize, sel: usize, highlight: bool) -> io::Result<()> {
     let items = MENUS[top].1;
     let (x, lw, sw, inner) = dropdown_geom(w, top);
     let bw = inner + 4;
@@ -1278,7 +1551,11 @@ fn draw_dropdown<W: Write>(out: &mut W, w: usize, top: usize, sel: usize) -> io:
         } else {
             put(out, x, y, "│", BORDER)?;
             let left = format!(" {}   ", fit(it.0, lw));
-            let right = format!("{} ", fit(it.1, sw));
+            let hint = match it.2 {
+                Cmd::Highlight => if highlight { "On" } else { "Off" },
+                _ => it.1,
+            };
+            let right = format!("{} ", fit(hint, sw));
             if i == sel {
                 put(out, x + 1, y, &format!("{}{}", left, right), SEL)?;
             } else {
@@ -1386,14 +1663,25 @@ fn restore_terminal() {
 }
 
 fn main() -> io::Result<()> {
-    let arg = std::env::args().nth(1);
-    if matches!(arg.as_deref(), Some("-h") | Some("--help")) {
-        println!("antpad - tiny terminal notepad\n\nUsage: antpad [FILE]\n\nPress F10 or Alt+F/E/S/H for menus.");
-        return Ok(());
+    let mut arg = None;
+    let mut highlight = false;
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "antpad - tiny terminal notepad\n\nUsage: antpad [--highlight] [FILE]\n\n  -H, --highlight  enable syntax highlighting (off by default;\n                   also togglable in Edit > Syntax Highlight)\n\nPress F10 or Alt+F/E/S/H for menus."
+                );
+                return Ok(());
+            }
+            "-H" | "--highlight" => highlight = true,
+            _ if arg.is_none() => arg = Some(a),
+            _ => {}
+        }
     }
 
     let (w, h) = terminal::size()?;
     let mut ed = Editor::new(w, h);
+    ed.highlight = highlight;
     if let Some(a) = arg {
         ed.open_path(expand(&a));
     }
